@@ -190,6 +190,7 @@ td{text-align:right;padding:4px 12px;color:#C6D2D9;border-bottom:1px solid #141B
     <div style="display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;padding:11px 16px;border-bottom:1px solid #1E262C">
       <span style="font-size:12.5px;font-weight:600;letter-spacing:.06em;white-space:nowrap">DEMAND FORECAST · D+1</span>
       <span class="mono" style="font-size:11px;color:#63727C">72 h actual → 24 h predicted</span>
+      <span id="fcModelLine" class="mono" style="font-size:11px;color:#63727C"></span>
       <span id="fcChip" class="mono" style="margin-left:auto;font-size:10.5px;letter-spacing:.1em;padding:3px 9px"></span>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:1px;background:#1E262C;border-bottom:1px solid #1E262C">
@@ -228,10 +229,12 @@ td{text-align:right;padding:4px 12px;color:#C6D2D9;border-bottom:1px solid #141B
     </div>
     <div style="padding:8px 16px 0"><svg id="cFcast" viewBox="0 0 1180 320" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Recent actual demand with reserved forecast region" style="display:block;width:100%;height:auto"></svg></div>
     <div style="display:flex;gap:8px;padding:8px 16px 12px">
-      <button type="button" id="btnFcNote" class="btn-ghost">FEED CONTRACT</button>
+      <button type="button" id="btnFcNote" class="btn-ghost">READ THE CHART</button>
     </div>
     <div id="panelFcNote" hidden style="border-top:1px solid #1E262C;padding:12px 16px;font-size:12.5px;line-height:1.7;color:#94A3AC;max-width:920px">
-      No forecast values are shown until a model supplies them. To feed one, set <code style="font-family:'IBM Plex Mono',monospace;color:#FFB020">window.FORECAST</code> to an array of 96 quarter-hour points for the day after the selected day and re-render:
+      <div><b style="color:#C6D2D9;font-weight:600">Baseline model, not a fabricated number.</b> The dashed curve blends 70% of yesterday's actual demand profile with 30% of a recency-weighted average shape (last ~5 days) scaled to a recency-weighted recent level — a transparent statistical baseline, not a trained ML forecaster. It is recalibrated from the embedded record on every load: <span id="fcModelStats">—</span>. The band is ±1.28σ (≈80%) from the per-interval residual spread of that same rolling backtest, so both the curve and the band are derived, never invented.</div>
+      <div style="margin-top:9px">Pick an earlier day and this panel becomes a backtest: D+1 is already in the record, so the predicted curve is checked against real actuals and MAPE fills in live. Only the final day's forecast is genuinely out-of-sample.</div>
+      <div style="margin-top:9px">To swap in a real model, assign <code style="font-family:'IBM Plex Mono',monospace;color:#FFB020">window.FORECAST</code> to an array of 96 quarter-hour points for the day after the selected day <em>before this page's script runs</em> — that disables the baseline model and this panel defers to your values instead:</div>
       <div class="mono" style="font-size:11.5px;color:#C6D2D9;background:#0A0D10;border:1px solid #1E262C;padding:10px 12px;margin-top:9px;overflow:auto">window.FORECAST = [{ d:"2026-09-08", t:"0:15", p:224310, lo:220100, hi:228500 }, … ]</div>
       <div style="margin-top:9px"><code style="font-family:'IBM Plex Mono',monospace;color:#FFB020">p</code> is predicted demand met in MW; <code style="font-family:'IBM Plex Mono',monospace;color:#FFB020">lo</code>/<code style="font-family:'IBM Plex Mono',monospace;color:#FFB020">hi</code> the confidence band (optional). Forecast peak reads from <code style="font-family:'IBM Plex Mono',monospace;color:#FFB020">max(p)</code>; MAPE is computed against actuals once the forecast day exists in the record, so the slots fill themselves.</div>
     </div>
@@ -300,6 +303,7 @@ var fmt=function(n){return Math.round(n).toLocaleString('en-US');};
 // ---- state ----
 var state={day:null,mode:CFG.defaultMode==='duck'?'duck':'stack',hide:[],open:{},regMetric:'ws'};
 var by,dates,dsBy,stats,nRec,reg;
+var forecastIsExternal=false;
 
 function band(){return [CFG.freqBandLow, CFG.freqBandHigh];}
 
@@ -322,6 +326,7 @@ function prep(){
         reShare:energy?(w+s2+h)/energy*100:0};
     });
   });
+  calibrateForecastModel();
 }
 
 function calc(d){
@@ -352,6 +357,86 @@ function ctx(sel,val,fmtf,invert){
   var rank=sorted.indexOf(val)+1;
   return{pct:hi>lo?((val-lo)/(hi-lo)*100).toFixed(1):50,lo:fmtf(lo),hi:fmtf(hi),
     rank:'#'+rank+' of '+all.length};
+}
+
+// ---- demand forecast: baseline statistical model ----
+// Transparent heuristic, not a trained model: blends recency-weighted
+// persistence with a recency-weighted average intraday shape. Recalibrated
+// against the embedded record itself (rolling one-day-ahead backtest) so
+// both the curve and its confidence band are derived, never hardcoded.
+// Superseded entirely if window.FORECAST is assigned before this script runs.
+var FCPARAMS={hlLevel:1,hlShape:5,alpha:0.7,z:1.2816};
+var fcSigma=null,fcBacktest=null;
+
+function dayMeanOf(d){var rows=by[d];return rows.reduce(function(a,r){return a+r.dm;},0)/rows.length;}
+function ratioVecOf(d){
+  var rows=by[d],m=dayMeanOf(d),v=new Array(96).fill(null);
+  rows.forEach(function(r){v[Math.round(tmin(r.t)/15)]=r.dm/m;});
+  return v;
+}
+function profileVecOf(d){
+  var rows=by[d],v=new Array(96).fill(null);
+  rows.forEach(function(r){v[Math.round(tmin(r.t)/15)]=r.dm;});
+  return v;
+}
+function ageDays(target,d){return (new Date(target)-new Date(d))/86400000;}
+
+function forecastProfile(target,histDates){
+  if(!histDates.length)return null;
+  var hlLevel=FCPARAMS.hlLevel,hlShape=FCPARAMS.hlShape,alpha=FCPARAMS.alpha,i;
+  var lw=0,lsum=0;
+  histDates.forEach(function(d){var w=Math.pow(0.5,ageDays(target,d)/hlLevel);lw+=w;lsum+=w*dayMeanOf(d);});
+  var level=lsum/lw;
+  var sum=new Array(96).fill(0),wsum=new Array(96).fill(0);
+  histDates.forEach(function(d){
+    var w=Math.pow(0.5,ageDays(target,d)/hlShape),rv=ratioVecOf(d);
+    rv.forEach(function(v,idx){if(v!=null){sum[idx]+=v*w;wsum[idx]+=w;}});
+  });
+  var ewma=new Array(96);
+  for(i=0;i<96;i++)ewma[i]=level*(wsum[i]?sum[i]/wsum[i]:1);
+  var prevProfile=profileVecOf(histDates[histDates.length-1]);
+  var p=new Array(96);
+  for(i=0;i<96;i++)p[i]=prevProfile[i]!=null?alpha*prevProfile[i]+(1-alpha)*ewma[i]:ewma[i];
+  return p;
+}
+
+function calibrateForecastModel(){
+  var residBySlot=[],i,s;for(i=0;i<96;i++)residBySlot.push([]);
+  var mapes=[];
+  for(var di=10;di<dates.length;di++){
+    var target=dates[di],hist=dates.slice(0,di);
+    var p=forecastProfile(target,hist);
+    if(!p)continue;
+    var rows=by[target],act={};
+    rows.forEach(function(r){act[Math.round(tmin(r.t)/15)]=r.dm;});
+    var sum=0,n=0;
+    for(s=0;s<96;s++){
+      if(act[s]!=null){residBySlot[s].push(act[s]-p[s]);sum+=Math.abs(p[s]-act[s])/act[s];n++;}
+    }
+    if(n)mapes.push(sum/n*100);
+  }
+  fcSigma=residBySlot.map(function(arr){
+    if(!arr.length)return 0;
+    var m=arr.reduce(function(a,b){return a+b;},0)/arr.length;
+    return Math.sqrt(arr.reduce(function(a,b){return a+(b-m)*(b-m);},0)/arr.length);
+  });
+  fcBacktest=mapes.length?{mape:mapes.reduce(function(a,b){return a+b;},0)/mapes.length,n:mapes.length}:null;
+}
+
+function buildForecast(selectedDay){
+  var idx=dates.indexOf(selectedDay);
+  var hist=dates.slice(0,idx+1);
+  var nextDate=new Date(selectedDay);nextDate.setDate(nextDate.getDate()+1);
+  var nd=nextDate.toISOString().slice(0,10);
+  var p=forecastProfile(nd,hist);
+  if(!p)return[];
+  var z=FCPARAMS.z,out=[];
+  for(var i=0;i<96;i++){
+    var mins=i*15,hh=Math.floor(mins/60),mm=mins%60,t=hh+':'+String(mm).padStart(2,'0');
+    var sigma=fcSigma?fcSigma[i]:0;
+    out.push({d:nd,t:t,p:Math.round(p[i]),lo:Math.round(Math.max(0,p[i]-z*sigma)),hi:Math.round(p[i]+z*sigma)});
+  }
+  return out;
 }
 
 // ---- tooltip ----
@@ -855,8 +940,8 @@ function renderDom(){
     if(pairs.length)mape=pairs.reduce(function(a,p){return a+Math.abs(p.p-act[p.t])/act[p.t];},0)/pairs.length*100;
   }
   var fcChip=el('fcChip');
-  fcChip.textContent=F.length?'FORECAST LOADED':'AWAITING MODEL';
-  var fcChipFg=F.length?'#3DD6E0':'#FFB020';
+  fcChip.textContent=!F.length?'AWAITING MODEL':(forecastIsExternal?'FORECAST LOADED':'BASELINE MODEL');
+  var fcChipFg=!F.length?'#FFB020':(forecastIsExternal?'#3DD6E0':'#FFB020');
   fcChip.style.color=fcChipFg;fcChip.style.border='1px solid '+fcChipFg;
   var fcSlotFg=F.length?'#E6EDF2':'#3B474F';
   el('fcPeakVal').style.color=fcSlotFg;el('fcMapeVal').style.color=fcSlotFg;
@@ -866,6 +951,8 @@ function renderDom(){
   setText('fcMapeNote',mape!=null?'vs actuals for '+nd:'computed once actuals for D+1 exist');
   setText('fcHorizonNote','D+1 · '+new Date(nd).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}));
   setText('fcLastActual',fmt(S.peak));
+  setText('fcModelLine',forecastIsExternal?'· external model':(fcBacktest?'· baseline model · backtested '+fcBacktest.mape.toFixed(2)+'% MAPE over '+fcBacktest.n+' days':'· baseline model'));
+  setText('fcModelStats',fcBacktest?'backtested '+fcBacktest.mape.toFixed(2)+'% mean MAPE, one day ahead, over the '+fcBacktest.n+' days in this record with enough history to score':'insufficient history to backtest yet');
 
   // trend table
   var trendRows=dates.slice().reverse().map(function(x){var p=stats[x];
@@ -878,7 +965,10 @@ function renderDom(){
   if(sel.value!==d)sel.value=d;
 }
 
-function render(){renderDom();draw();}
+function render(){
+  if(!forecastIsExternal)window.FORECAST=buildForecast(state.day);
+  renderDom();draw();
+}
 
 function setDay(d){state.day=d;render();}
 
@@ -920,6 +1010,7 @@ function bindStaticEvents(){
 
 function init(){
   if(!(window.d3&&window.TS&&window.DS)){setTimeout(init,80);return;}
+  forecastIsExternal=Array.isArray(window.FORECAST)&&window.FORECAST.length>0;
   prep();
   state.day=dates[dates.length-1];
   bindStaticEvents();
